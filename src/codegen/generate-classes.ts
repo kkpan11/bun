@@ -361,12 +361,6 @@ JSC_DECLARE_CUSTOM_GETTER(js${typeName}Constructor);
 `;
   }
 
-  if (obj.wantsThis) {
-    externs += `
-extern JSC_CALLCONV void* JSC_HOST_CALL_ATTRIBUTES ${classSymbolName(typeName, "_setThis")}(JSC::JSGlobalObject*, void*, JSC::EncodedJSValue);
-`;
-  }
-
   if (obj.structuredClone) {
     externs +=
       `extern JSC_CALLCONV void JSC_HOST_CALL_ATTRIBUTES ${symbolName(
@@ -652,13 +646,6 @@ JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES ${name}::construct(JSC::JSGlobalObj
   }
 
     auto value = JSValue::encode(instance);
-${
-  obj.wantsThis
-    ? `
-    ${classSymbolName(typeName, "_setThis")}(globalObject, ptr, value);
-`
-    : ""
-}
     RELEASE_AND_RETURN(scope, value);
 }
 
@@ -1189,7 +1176,23 @@ JSC_DEFINE_HOST_FUNCTION(${symbolName(typeName, name)}Callback, (JSGlobalObject 
 
   return rows.map(a => a.trim()).join("\n");
 }
+function allCachedValues(obj: ClassDefinition) {
+  let values = (obj.values ?? []).slice().map(name => [name, `m_${name}`]);
+  for (const name in obj.proto) {
+    let cacheName = obj.proto[name].cache;
+    if (cacheName === true) {
+      cacheName = "m_" + name;
+    } else if (cacheName) {
+      cacheName = `m_${cacheName}`;
+    }
 
+    if (cacheName) {
+      values.push([name, cacheName]);
+    }
+  }
+
+  return values;
+}
 var extraIncludes = [];
 function generateClassHeader(typeName, obj: ClassDefinition) {
   var { klass, proto, JSType = "ObjectType", values = [], callbacks = {}, zigOnly = false } = obj;
@@ -1377,7 +1380,8 @@ function generateClassImpl(typeName, obj: ClassDefinition) {
     .join("\n");
 
   for (const name in callbacks) {
-    DEFINE_VISIT_CHILDREN_LIST += "\n" + `    visitor.append(thisObject->m_callback_${name});`;
+    // Use appendHidden so it doesn't show up in the heap snapshot twice.
+    DEFINE_VISIT_CHILDREN_LIST += "\n" + `    visitor.appendHidden(thisObject->m_callback_${name});`;
   }
 
   const values = (obj.values || [])
@@ -1591,6 +1595,19 @@ void ${name}::analyzeHeap(JSCell* cell, HeapAnalyzer& analyzer)
     }
 
     Base::analyzeHeap(cell, analyzer);
+    ${allCachedValues(obj).length > 0 ? `auto& vm = thisObject->vm();` : ""}
+
+    ${allCachedValues(obj)
+      .map(
+        ([name, cacheName]) => `
+if (JSValue ${cacheName}Value = thisObject->${cacheName}.get()) {
+  if (${cacheName}Value.isCell()) {
+    const Identifier& id = Identifier::fromString(vm, "${name}"_s);
+    analyzer.analyzePropertyNameEdge(cell, ${cacheName}Value.asCell(), id.impl());
+  }
+}`,
+      )
+      .join("\n  ")}
 }
 
 ${
@@ -1661,7 +1678,6 @@ function generateZig(
     construct,
     finalize,
     noConstructor = false,
-    wantsThis = false,
     overridesToJS = false,
     estimatedSize,
     call = false,
@@ -1790,16 +1806,6 @@ const JavaScriptCoreBindings = struct {
               return null;
             },
           });
-        }
-      `;
-    }
-
-    if (construct && !noConstructor && wantsThis) {
-      exports.set("_setThis", classSymbolName(typeName, "_setThis"));
-      output += `
-        pub fn ${classSymbolName(typeName, "_setThis")}(globalObject: *JSC.JSGlobalObject, ptr: *anyopaque, this: JSC.JSValue) callconv(JSC.conv) void {
-          const real: *${typeName} = @ptrCast(@alignCast(ptr));
-          real.this_value.set(globalObject, this);
         }
       `;
     }
